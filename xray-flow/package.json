@@ -1,0 +1,10 @@
+{
+  "name": "xray-flow-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix extension run dev",
+    "build": "npm --prefix extension run build",
+    "backend": "python -m uvicorn main:app --reload --port 8000"
+  }
+}

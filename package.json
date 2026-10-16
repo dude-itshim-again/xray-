@@ -1,0 +1,9 @@
+{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix xray-flow/extension run dev",
+    "build": "npm --prefix xray-flow/extension run build"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "XRay Flow",
+  "version": "1.0.0",
+  "description": "Analyze any website or GitHub repo — visualize tech stack, workflow, and architecture flowchart.",
+  "permissions": ["sidePanel", "activeTab", "scripting", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "Open XRay Flow"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {}
+}
