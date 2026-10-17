@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import asyncio
 import traceback
 import httpx
 from typing import List, Dict, Any, Optional
@@ -47,6 +48,7 @@ class TechItem(BaseModel):
     name: str
     category: str
     purpose: str
+    evidence: str  # Exact signal from siteSignals that proves this tech is used
 
 class AnalysisResponse(BaseModel):
     mode: str
@@ -96,35 +98,168 @@ def get_gemini_model(system_prompt: str):
         system_instruction=system_prompt,
     )
 
+async def fetch_github_context(repo_url: str) -> dict:
+    clean_url = repo_url.split("?")[0].split("#")[0].rstrip("/")
+    parts = clean_url.split("github.com/")[-1].split("/")
+    if len(parts) < 2:
+        return {
+            "owner": "",
+            "repo": "",
+            "note": "Invalid GitHub repository URL",
+            "domFallback": True,
+            "fileTree": [],
+            "keyFiles": {},
+        }
+    owner, repo = parts[0], parts[1].replace(".git", "")
+
+    headers = {"Accept": "application/vnd.github.v3+json", "User-Agent": "XRay-Flow"}
+    gh_token = os.getenv("GITHUB_TOKEN")
+    if gh_token and not gh_token.startswith("your_"):
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            repo_res = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers)
+            if repo_res.status_code != 200:
+                print(f"⚠️ GitHub API returned status {repo_res.status_code}, activating DOM fallback...", flush=True)
+                return {
+                    "owner": owner,
+                    "repo": repo,
+                    "note": f"GitHub API status {repo_res.status_code}, using scraped DOM signals",
+                    "domFallback": True,
+                    "fileTree": [],
+                    "keyFiles": {},
+                }
+            repo_info = repo_res.json()
+            default_branch = repo_info.get("default_branch", "main")
+
+            tree_res = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1",
+                headers=headers
+            )
+            tree_data = tree_res.json().get("tree", []) if tree_res.status_code == 200 else []
+            file_paths = [item["path"] for item in tree_data if item.get("type") == "blob"][:120]
+
+            # Priority 1: Root README.md (or readme.md) -> truncate to 1500 chars
+            target_files: Dict[str, int] = {}
+            for path in file_paths:
+                if "/" not in path and path.lower() in ("readme.md", "readme"):
+                    target_files[path] = 1500
+                    break
+
+            # Priority 2: Root manifest -> truncate to 1500 chars
+            root_manifests = [
+                "package.json", "requirements.txt", "pyproject.toml",
+                "Cargo.toml", "go.mod", "Dockerfile"
+            ]
+            for m in root_manifests:
+                if len(target_files) >= 4:
+                    break
+                if m in file_paths:
+                    target_files[m] = 1500
+
+            # Priority 3: If fewer than 3 files matched, pick up to 2 root or top-level code/HTML files (.html, .py, .ts, .js) -> truncate to 1200 chars
+            if len(target_files) < 3:
+                code_added = 0
+                for path in file_paths:
+                    if len(target_files) >= 4 or code_added >= 2:
+                        break
+                    if path not in target_files and path.endswith((".html", ".py", ".ts", ".js")):
+                        if path.count("/") <= 1:
+                            target_files[path] = 1200
+                            code_added += 1
+
+            # Parallel download of target files (max 4 files)
+            async def fetch_file(path: str, max_chars: int):
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{default_branch}/{path}"
+                try:
+                    res = await client.get(raw_url)
+                    if res.status_code == 200:
+                        return path, res.text[:max_chars]
+                except Exception as err:
+                    print(f"⚠️ Error fetching {path}: {err}", flush=True)
+                return path, None
+
+            tasks = [fetch_file(p, max_c) for p, max_c in target_files.items()]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            fetched_files = {}
+            for res in results:
+                if isinstance(res, tuple) and res[1] is not None:
+                    fetched_files[res[0]] = res[1]
+
+            return {
+                "owner": owner,
+                "repo": repo,
+                "description": repo_info.get("description"),
+                "primaryLanguage": repo_info.get("language"),
+                "branch": default_branch,
+                "fileTree": file_paths,
+                "keyFiles": fetched_files,
+            }
+    except Exception as e:
+        print(f"⚠️ GitHub fetch exception ({e}), activating DOM fallback...", flush=True)
+        return {
+            "owner": owner,
+            "repo": repo,
+            "note": f"GitHub API error ({str(e)}), using scraped DOM signals",
+            "domFallback": True,
+            "fileTree": [],
+            "keyFiles": {},
+        }
+
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_target(req: AnalyzeRequest):
     print(f"\n🟢 INCOMING REQUEST: mode={req.mode}, url={req.url}", flush=True)
     try:
         if req.mode == "github":
-            context_data = {"url": req.url, "note": "GitHub scraping placeholder"}
+            print("📂 Fetching GitHub context...", flush=True)
+            context_data = await fetch_github_context(req.url)
+            # Merge siteSignals if rate-limited or keyFiles is empty
+            if context_data.get("domFallback") or not context_data.get("keyFiles"):
+                context_data["signals"] = req.siteSignals or {}
+                if req.siteSignals and isinstance(req.siteSignals, dict):
+                    if not context_data.get("fileTree") and req.siteSignals.get("githubFiles"):
+                        context_data["fileTree"] = req.siteSignals.get("githubFiles", [])
+                    if not context_data.get("keyFiles"):
+                        context_data["keyFiles"] = {}
+                    if req.siteSignals.get("githubReadme") and "README.md" not in context_data["keyFiles"]:
+                        context_data["keyFiles"]["README.md"] = req.siteSignals.get("githubReadme")[:1500]
+            print(f"⚡ GitHub context ready ({len(str(context_data))} chars). Calling Gemini...", flush=True)
         else:
             context_data = {"url": req.url, "signals": req.siteSignals or {}}
 
         system_prompt = """
-        Analyze the target web application. Return a JSON object matching the exact schema.
+        Analyze the target application. Return a JSON object matching the exact schema.
         Provide 3 valid Mermaid 'graph TD' diagrams:
         1. mermaidCode: High-level architecture.
         2. diagramDataFlow: Request lifecycle.
         3. diagramModuleMap: Component map.
 
-       CRITICAL MERMAID RULES:
-- YOU MUST NOT use markdown code blocks (do not use ```mermaid). Return only the raw text.
-- You MUST use 'graph TD'.
-- Node IDs MUST be simple one-word alphabetical strings (e.g., A, B, WebServer, Database). NO spaces or dashes in Node IDs!
-- Node Labels MUST ALWAYS be wrapped in double quotes. 
-- CORRECT: WebServer["Main App (Next.js)"]
-- INCORRECT: Web-Server[Main App (Next.js)]
+        STRICT WEBSITE GROUND-TRUTH RULES:
+        - You may ONLY list technologies in `techStack` that have direct proof in `signals` (e.g., script src paths, frameworkMarkers, customElements, apiCalls, stylesheets, or storageKeys).
+        - For every TechItem, populate `evidence` with the exact signal found (e.g., "Found '/@vite/client' and '/src/main.tsx' in scripts", "Detected custom element <ytd-app>", or "Fetch call to 127.0.0.1:8000/api/auth").
+        - Do NOT guess backend databases (like PostgreSQL, MongoDB, Prisma) on a live website unless explicitly exposed in `apiCalls` or `storageKeys` (like Supabase/Firebase URLs). If the backend database is hidden behind an API, only list the observed REST/GraphQL API endpoint!
+
+        STRICT GITHUB GROUND-TRUTH RULES:
+        - NEVER guess or hallucinate frameworks (like Next.js, React, Prisma, Tailwind, or Databases) if they are not explicitly evidenced in the provided fileTree, keyFiles, or website signals.
+        - For every TechItem, populate `evidence` with the exact file or dependency found (e.g., "Found in package.json", "Found in requirements.txt", "Observed in fileTree").
+        - If a repository only contains static HTML, CSS, JS, and Markdown files with no build step or backend, state that clearly in projectSummary and ONLY list the actual languages/files present (e.g., HTML5, CSS3, Vanilla JS, Markdown) in techStack.
+        - Base all 3 Mermaid diagrams strictly on the actual files in fileTree (e.g., showing how README.md, report.html, and mindmap.html relate in a static repo).
+
+        CRITICAL MERMAID RULES:
+        - YOU MUST NOT use markdown code blocks (do not use ```mermaid). Return only the raw text.
+        - You MUST use 'graph TD'.
+        - Node IDs MUST be simple one-word alphabetical strings (e.g., A, B, WebServer, Database). NO spaces or dashes in Node IDs!
+        - Node Labels MUST ALWAYS be wrapped in double quotes. 
+        - CORRECT: WebServer["Main App (Next.js)"]
+        - INCORRECT: Web-Server[Main App (Next.js)]
         """
 
         model = get_gemini_model(system_prompt)
 
         print("⏳ Calling Gemini API...", flush=True)
-        prompt = f"TARGET: {req.url}\nDATA: {json.dumps(context_data)[:3000]}"
+        prompt = f"TARGET: {req.url}\nDATA: {json.dumps(context_data)[:7500]}"
         
         try:
             response = model.generate_content(prompt)
