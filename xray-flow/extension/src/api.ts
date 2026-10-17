@@ -288,7 +288,7 @@ async function callGemini(
     throw new Error("Missing Gemini API Key. Please add it in Settings.");
   }
 
-  const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+  const models = ["gemini-2.5-flash"];
   let lastError: Error | null = null;
 
   for (const model of models) {
