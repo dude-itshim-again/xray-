@@ -3,6 +3,7 @@
 export interface StoredKeys {
   geminiKey: string;
   githubToken: string;
+  preferredModel?: string;
 }
 
 export interface TechItem {
@@ -26,6 +27,7 @@ export interface AnalysisResult {
   diagramDataFlow: string;
   diagramModuleMap: string;
   nodeFileMap?: NodeFileEntry[];
+  usedModel?: string;
 }
 
 export interface ChatResult {
@@ -33,6 +35,7 @@ export interface ChatResult {
   reply?: string;
   relevantFiles?: string[];
   optionalMermaid?: string;
+  usedModel?: string;
 }
 
 export interface GitHubContext {
@@ -51,35 +54,46 @@ export interface GitHubContext {
 export async function getStoredKeys(): Promise<StoredKeys> {
   if (typeof chrome !== "undefined" && chrome.storage?.local) {
     return new Promise((resolve) => {
-      chrome.storage.local.get(["geminiKey", "githubToken"], (result) => {
-        resolve({
-          geminiKey: result.geminiKey || "",
-          githubToken: result.githubToken || "",
-        });
-      });
+      chrome.storage.local.get(
+        ["geminiKey", "githubToken", "preferredModel"],
+        (result) => {
+          resolve({
+            geminiKey: result.geminiKey || "",
+            githubToken: result.githubToken || "",
+            preferredModel: result.preferredModel || "auto",
+          });
+        }
+      );
     });
   }
   try {
     return {
       geminiKey: localStorage.getItem("xray_gemini_key") || "",
       githubToken: localStorage.getItem("xray_github_token") || "",
+      preferredModel: localStorage.getItem("xray_preferred_model") || "auto",
     };
   } catch {
-    return { geminiKey: "", githubToken: "" };
+    return { geminiKey: "", githubToken: "", preferredModel: "auto" };
   }
 }
 
 export async function saveStoredKeys(
   geminiKey: string,
-  githubToken: string
+  githubToken: string,
+  preferredModel: string = "auto"
 ): Promise<void> {
   const cleanGemini = (geminiKey || "").trim();
   const cleanGithub = (githubToken || "").trim();
+  const cleanModel = (preferredModel || "auto").trim();
 
   if (typeof chrome !== "undefined" && chrome.storage?.local) {
     return new Promise((resolve) => {
       chrome.storage.local.set(
-        { geminiKey: cleanGemini, githubToken: cleanGithub },
+        {
+          geminiKey: cleanGemini,
+          githubToken: cleanGithub,
+          preferredModel: cleanModel,
+        },
         () => resolve()
       );
     });
@@ -87,6 +101,7 @@ export async function saveStoredKeys(
   try {
     localStorage.setItem("xray_gemini_key", cleanGemini);
     localStorage.setItem("xray_github_token", cleanGithub);
+    localStorage.setItem("xray_preferred_model", cleanModel);
   } catch {
     // Ignore storage errors in restricted contexts
   }
@@ -277,72 +292,199 @@ export async function fetchGithubContext(
   }
 }
 
-// ── 4. Direct Gemini REST Engine ─────────────────────────────────────────────
-async function callGemini(
+// ── 4. Dynamic Gemini Discovery & Failover Engine ───────────────────────────
+
+// Up-to-date fallback list ordered from newest stable Flash models to lightweight/legacy tiers
+export const FALLBACK_FLASH_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+];
+
+const EXCLUDED_KEYWORDS = [
+  "tts",
+  "live",
+  "image",
+  "transcribe",
+  "embedding",
+  "aqa",
+  "vision",
+  "audio",
+  "banana",
+];
+
+/**
+ * Queries Google's v1beta/models endpoint to discover all text-generation Flash models
+ * currently enabled for this specific API key, sorted from newest version to oldest.
+ */
+export async function discoverAvailableModels(geminiKey: string): Promise<string[]> {
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${geminiKey}`
+    );
+    if (!res.ok) return FALLBACK_FLASH_MODELS;
+
+    const data = await res.json();
+    const models: any[] = data.models || [];
+
+    const validFlashModels = models
+      .filter((m) => {
+        const name = (m.name || "").replace("models/", "").toLowerCase();
+        const methods: string[] = m.supportedGenerationMethods || [];
+        const supportsGenerate = methods.includes("generateContent");
+        const isGeminiFlash = name.startsWith("gemini-") && name.includes("flash");
+        const isExcluded = EXCLUDED_KEYWORDS.some((kw) => name.includes(kw));
+        return supportsGenerate && isGeminiFlash && !isExcluded;
+      })
+      .map((m) => (m.name as string).replace("models/", ""));
+
+    // Sort dynamically by version number (e.g., 4.0 > 3.8 > 3.7 > 3.6 > 3.5 > 2.5)
+    // and prefer standard stable "-flash" over "-lite" or "-preview" within the same version
+    validFlashModels.sort((a, b) => {
+      const verA = parseFloat(a.match(/gemini-(\d+(?:\.\d+)?)/)?.[1] || "0");
+      const verB = parseFloat(b.match(/gemini-(\d+(?:\.\d+)?)/)?.[1] || "0");
+      if (verB !== verA) return verB - verA;
+
+      const score = (name: string) => {
+        if (/^gemini-\d+(\.\d+)?-flash$/.test(name)) return 3; // Exact stable release
+        if (name.includes("lite") && !name.includes("preview")) return 2; // Stable lite
+        if (!name.includes("preview") && !name.includes("exp")) return 1;
+        return 0;
+      };
+      return score(b) - score(a);
+    });
+
+    return validFlashModels.length > 0
+      ? Array.from(new Set([...validFlashModels, ...FALLBACK_FLASH_MODELS]))
+      : FALLBACK_FLASH_MODELS;
+  } catch {
+    return FALLBACK_FLASH_MODELS;
+  }
+}
+
+/**
+ * Unified Gemini caller with dynamic discovery, automatic fallback across models,
+ * and working model caching in local storage.
+ */
+export async function callGeminiWithAutoFallback(
   geminiKey: string,
-  systemPrompt: string,
-  userPrompt: string,
-  responseSchema?: any
-): Promise<any> {
+  payload: Record<string, any>,
+  preferredModel?: string
+): Promise<{ data: any; usedModel: string }> {
   if (!geminiKey) {
     throw new Error("Missing Gemini API Key. Please add it in Settings.");
   }
 
-  const models = ["gemini-2.5-flash"];
-  let lastError: Error | null = null;
+  const discovered = await discoverAvailableModels(geminiKey);
 
-  for (const model of models) {
+  // Put user's preferred or last-known working model at the front of the queue
+  let frontModel =
+    preferredModel && preferredModel !== "auto" ? preferredModel : undefined;
+
+  if (!frontModel) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-      const generationConfig: any = {
-        responseMimeType: "application/json",
-        temperature: 0.2,
-      };
-      if (responseSchema) {
-        generationConfig.responseSchema = responseSchema;
+      if (typeof chrome !== "undefined" && chrome.storage?.local) {
+        const stored = await new Promise<any>((resolve) =>
+          chrome.storage.local.get(["lastWorkingModel"], resolve)
+        );
+        if (stored?.lastWorkingModel) frontModel = stored.lastWorkingModel;
+      } else {
+        frontModel = localStorage.getItem("xray_last_working_model") || undefined;
       }
-
-      const body: any = {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: userPrompt }],
-          },
-        ],
-        systemInstruction: {
-          parts: [{ text: systemPrompt }],
-        },
-        generationConfig,
-      };
-
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Gemini ${model} error (${res.status}): ${errText}`);
-      }
-
-      const data = await res.json();
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!rawText) {
-        throw new Error(`Empty response from Gemini ${model}`);
-      }
-
-      return JSON.parse(rawText);
-    } catch (err: any) {
-      console.warn(`[XRay Flow] Model ${model} attempt failed:`, err);
-      lastError = err;
-      // Continue to fallback model
+    } catch {
+      // Storage access failure
     }
   }
 
-  throw lastError || new Error("All Gemini model attempts failed.");
+  const candidateQueue =
+    frontModel
+      ? [frontModel, ...discovered.filter((m) => m !== frontModel)]
+      : discovered;
+
+  let lastError = "";
+
+  for (const modelName of candidateQueue) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (typeof chrome !== "undefined" && chrome.storage?.local) {
+          chrome.storage.local.set({ lastWorkingModel: modelName });
+        } else {
+          try {
+            localStorage.setItem("xray_last_working_model", modelName);
+          } catch {}
+        }
+        return { data, usedModel: modelName };
+      }
+
+      const errText = await response.text();
+      lastError = `${modelName} (${response.status}): ${errText}`;
+
+      // If 400 Invalid API Key, stop immediately and alert user
+      if (
+        response.status === 400 &&
+        errText.toLowerCase().includes("api key not valid")
+      ) {
+        throw new Error(
+          "Invalid Gemini API Key. Please check your key in Settings."
+        );
+      }
+
+      // If 404 (deprecated/unavailable), 429 (quota exceeded), or 503 (overloaded),
+      // continue loop to try the next model automatically!
+      console.warn(
+        `[XRay Flow] Model ${modelName} failed with ${response.status}, trying next fallback...`
+      );
+    } catch (err: any) {
+      if (err.message?.includes("Invalid Gemini API Key")) throw err;
+      lastError = err.message || String(err);
+    }
+  }
+
+  throw new Error(`All Gemini models failed. Last error: ${lastError}`);
+}
+
+/**
+ * Backwards-compatible caller
+ */
+export async function callGemini(
+  geminiKey: string,
+  systemPrompt: string,
+  userPrompt: string,
+  responseSchema?: any,
+  preferredModel?: string
+): Promise<any> {
+  const payload: any = {
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.2,
+      ...(responseSchema ? { responseSchema } : {}),
+    },
+  };
+  const { data } = await callGeminiWithAutoFallback(
+    geminiKey,
+    payload,
+    preferredModel
+  );
+  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!rawText) throw new Error("Empty response from Gemini");
+  return JSON.parse(rawText);
 }
 
 export async function analyzeTarget(params: {
@@ -351,8 +493,9 @@ export async function analyzeTarget(params: {
   siteSignals?: any;
   geminiKey: string;
   githubToken?: string;
+  preferredModel?: string;
 }): Promise<AnalysisResult> {
-  const { url, mode, siteSignals, geminiKey, githubToken } = params;
+  const { url, mode, siteSignals, geminiKey, githubToken, preferredModel } = params;
 
   let contextData: any = {};
 
@@ -431,7 +574,44 @@ CRITICAL MERMAID RULES:
     contextData
   ).slice(0, 8000)}`;
 
-  const result = await callGemini(geminiKey, systemPrompt, userPrompt);
+  const payload = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: userPrompt }],
+      },
+    ],
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.2,
+    },
+  };
+
+  const { data, usedModel } = await callGeminiWithAutoFallback(
+    geminiKey,
+    payload,
+    preferredModel
+  );
+
+  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!rawText) {
+    throw new Error(`Empty response from Gemini (${usedModel})`);
+  }
+
+  let result: any = {};
+  try {
+    result = JSON.parse(rawText);
+  } catch (err) {
+    const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      result = JSON.parse(jsonMatch[1]);
+    } else {
+      throw err;
+    }
+  }
 
   // Sanitize all diagrams
   const cleanedArchitecture = cleanMermaid(result.mermaidCode || "");
@@ -472,6 +652,7 @@ CRITICAL MERMAID RULES:
     diagramDataFlow: cleanedDataFlow,
     diagramModuleMap: cleanedModuleMap,
     nodeFileMap,
+    usedModel,
   };
 }
 
@@ -481,8 +662,9 @@ export async function askChat(params: {
   question: string;
   history?: { role: string; content: string }[];
   geminiKey: string;
+  preferredModel?: string;
 }): Promise<ChatResult> {
-  const { url, mode, question, history, geminiKey } = params;
+  const { url, mode, question, history, geminiKey, preferredModel } = params;
 
   const systemPrompt = `You are an elite Principal Software Architect assisting a developer.
 Provide a concise, highly technical answer in GitHub-flavored Markdown.
@@ -503,7 +685,48 @@ Return a JSON object matching this schema:
     historyText ? `RECENT CONVERSATION:\n${historyText}\n\n` : ""
   }USER QUESTION: ${question}`;
 
-  const result = await callGemini(geminiKey, systemPrompt, userPrompt);
+  const payload = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: userPrompt }],
+      },
+    ],
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.3,
+    },
+  };
+
+  const { data, usedModel } = await callGeminiWithAutoFallback(
+    geminiKey,
+    payload,
+    preferredModel
+  );
+
+  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!rawText) {
+    throw new Error(`Empty response from Gemini (${usedModel})`);
+  }
+
+  let result: any = {};
+  try {
+    result = JSON.parse(rawText);
+  } catch {
+    const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      try {
+        result = JSON.parse(jsonMatch[1]);
+      } catch {
+        result = { answer: rawText };
+      }
+    } else {
+      result = { answer: rawText };
+    }
+  }
 
   return {
     answer: result.answer || result.reply || "No response received.",
@@ -512,5 +735,6 @@ Return a JSON object matching this schema:
     optionalMermaid: result.optionalMermaid
       ? cleanMermaid(result.optionalMermaid)
       : "",
+    usedModel,
   };
 }

@@ -5,6 +5,8 @@ import {
   saveStoredKeys,
   analyzeTarget,
   askChat,
+  discoverAvailableModels,
+  FALLBACK_FLASH_MODELS,
   TechItem,
 } from "./api";
 
@@ -83,6 +85,13 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
 
+  // Model selection state
+  const [preferredModel, setPreferredModel] = useState<string>("auto");
+  const [preferredModelInput, setPreferredModelInput] = useState<string>("auto");
+  const [availableModels, setAvailableModels] = useState<string[]>(FALLBACK_FLASH_MODELS);
+  const [activeModel, setActiveModel] = useState<string>("");
+  const [discoveringModels, setDiscoveringModels] = useState<boolean>(false);
+
   // Chat state
   const [chatMessages, setChatMessages] = useState<ChatMessageItem[]>([]);
   const [chatInput, setChatInput] = useState("");
@@ -95,12 +104,18 @@ export default function App() {
       const keys = await getStoredKeys();
       setGeminiKey(keys.geminiKey);
       setGithubToken(keys.githubToken);
+      setPreferredModel(keys.preferredModel || "auto");
       setGeminiKeyInput(keys.geminiKey);
       setGithubTokenInput(keys.githubToken);
+      setPreferredModelInput(keys.preferredModel || "auto");
 
       // Auto-open settings drawer if Gemini API key is missing
       if (!keys.geminiKey) {
         setShowSettings(true);
+      } else {
+        discoverAvailableModels(keys.geminiKey).then((models) => {
+          if (models.length > 0) setAvailableModels(models);
+        });
       }
     }
     loadKeys();
@@ -146,10 +161,21 @@ export default function App() {
   // ── Save Credentials ──────────────────────────────────────────────────────
   const handleSaveSettings = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    await saveStoredKeys(geminiKeyInput, githubTokenInput);
+    await saveStoredKeys(geminiKeyInput, githubTokenInput, preferredModelInput);
     setGeminiKey(geminiKeyInput.trim());
     setGithubToken(githubTokenInput.trim());
+    setPreferredModel(preferredModelInput.trim() || "auto");
     setSettingsSaved(true);
+
+    if (geminiKeyInput.trim()) {
+      setDiscoveringModels(true);
+      discoverAvailableModels(geminiKeyInput.trim())
+        .then((models) => {
+          if (models.length > 0) setAvailableModels(models);
+        })
+        .finally(() => setDiscoveringModels(false));
+    }
+
     setTimeout(() => {
       setSettingsSaved(false);
       setShowSettings(false);
@@ -362,7 +388,12 @@ export default function App() {
         siteSignals,
         geminiKey: geminiKey.trim(),
         githubToken: githubToken.trim() || undefined,
+        preferredModel: preferredModel,
       });
+
+      if (result.usedModel) {
+        setActiveModel(result.usedModel);
+      }
 
       const formattedData: AnalysisData = {
         mode: result.mode,
@@ -436,7 +467,12 @@ export default function App() {
           content: m.content,
         })),
         geminiKey: geminiKey.trim(),
+        preferredModel: preferredModel,
       });
+
+      if (chatRes.usedModel) {
+        setActiveModel(chatRes.usedModel);
+      }
 
       setChatMessages((prev) => [
         ...prev,
@@ -489,10 +525,25 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-1.5">
+          {/* Active Model Monospace Badge */}
+          {activeModel && (
+            <span
+              className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950/60 border border-emerald-800/60 text-emerald-400 flex items-center gap-1 tracking-tight"
+              title={`Active Model: ${activeModel}`}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              {activeModel}
+            </span>
+          )}
+
           {/* Status Dot */}
           <div
             className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#121215] border border-[#27272a]"
-            title={geminiKey ? "Gemini Engine Ready" : "API Key Required"}
+            title={
+              geminiKey
+                ? `Gemini Engine Ready (${preferredModel === "auto" ? "Auto-Detect" : preferredModel})`
+                : "API Key Required"
+            }
           >
             <span
               className={`w-1.5 h-1.5 rounded-full ${
@@ -572,6 +623,71 @@ export default function App() {
               placeholder="AIzaSy..."
               className="bg-[#09090b] border border-[#27272a] rounded px-2.5 py-1.5 text-xs text-white placeholder-zinc-600 focus:outline-none focus:border-zinc-500 font-mono"
             />
+          </div>
+
+          {/* Model Selection Field */}
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <label className="text-[11px] text-zinc-300 font-medium">
+                Model Selection
+              </label>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!geminiKeyInput.trim()) return;
+                  setDiscoveringModels(true);
+                  try {
+                    const list = await discoverAvailableModels(geminiKeyInput.trim());
+                    if (list.length > 0) setAvailableModels(list);
+                  } finally {
+                    setDiscoveringModels(false);
+                  }
+                }}
+                disabled={discoveringModels || !geminiKeyInput.trim()}
+                className="text-[10px] text-zinc-400 hover:text-white underline font-mono disabled:opacity-40"
+                title="Query Google models endpoint for currently active models"
+              >
+                {discoveringModels ? "Discovering…" : "Auto-Discover ⟳"}
+              </button>
+            </div>
+
+            {/* Quick dropdown select */}
+            <select
+              value={
+                preferredModelInput === "auto" || availableModels.includes(preferredModelInput)
+                  ? preferredModelInput
+                  : "custom"
+              }
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val !== "custom") {
+                  setPreferredModelInput(val);
+                }
+              }}
+              className="bg-[#09090b] border border-[#27272a] rounded px-2 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500 font-mono"
+            >
+              <option value="auto">auto — Auto-Detect Newest Available Model</option>
+              {availableModels.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+              {preferredModelInput !== "auto" && !availableModels.includes(preferredModelInput) && (
+                <option value="custom">Custom: {preferredModelInput}</option>
+              )}
+            </select>
+
+            {/* Manual override input */}
+            <input
+              type="text"
+              value={preferredModelInput}
+              onChange={(e) => setPreferredModelInput(e.target.value)}
+              placeholder="e.g. auto, gemini-3.8-flash, gemini-2.5-flash"
+              className="bg-[#09090b] border border-[#27272a] rounded px-2.5 py-1 text-[11px] text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-zinc-500 font-mono"
+            />
+            <span className="text-[9px] text-zinc-500 font-mono">
+              &quot;auto&quot; queries Google API for newest enabled Flash model with instant failover.
+            </span>
           </div>
 
           <div className="flex flex-col gap-1">
